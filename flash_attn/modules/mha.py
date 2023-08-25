@@ -8,6 +8,10 @@ import torch.nn as nn
 from einops import rearrange, repeat
 
 from flash_attn.utils.distributed import get_dim_for_local_rank
+from xformers.ops import fmha
+
+import triton
+import triton.language as tl
 
 try:
     from flash_attn import (
@@ -97,6 +101,30 @@ class FlashSelfAttention(nn.Module):
             )
 
 
+def xformers_gqa(q, k, v, **kwargs):
+    assert q.ndim == 5 # BMNHK
+    assert k.ndim == 5 # BMNHK
+    n_groups = k.shape[2]
+    n_heads = q.shape[3]
+    main_stream = torch.cuda.current_stream()
+    streams = [main_stream] + [
+        torch.cuda.Stream(device=q.device)
+        for _ in range(n_groups-1)
+    ]
+    outs = []
+    for group, stream in enumerate(streams):
+        stream.wait_stream(main_stream)
+        with torch.cuda.stream(stream):
+            _q = q[:, :, group]
+            _k = k[:, :, group]
+            _v = v[:, :, group]
+            outs.append(
+                fmha.memory_efficient_attention(_q, _k, _v, **kwargs)
+            )
+    for s in streams[1:]:
+        main_stream.wait_stream(s)
+    return torch.cat(outs, dim=2)
+
 class FlashCrossAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
     Arguments
@@ -125,6 +153,8 @@ class FlashCrossAttention(nn.Module):
         max_seqlen=None,
         cu_seqlens_k=None,
         max_seqlen_k=None,
+        xformers_attn_bias=None,
+        xformers_op=None,
     ):
         """Implements the multihead softmax attention.
         Arguments
@@ -139,6 +169,32 @@ class FlashCrossAttention(nn.Module):
                 of the sequences in the batch, used to index into kv.
             max_seqlen_k: int. Maximum sequence length in the batch of k and v.
         """
+        xformers_out = None
+        if q.shape[1] == 1 and xformers_attn_bias is not None:
+            B, M, H, K = q.shape
+            Mkv = kv.shape[1]
+            Hkv = kv.shape[-2]
+            if Hkv != H:  # GQA
+                kv = kv.reshape(1, Mkv * B, 2, Hkv, 1, K).expand(-1, -1, -1, -1, H // Hkv, -1)
+                q = q.reshape(1, M * B, Hkv, H // Hkv, K)
+            else:
+                kv = kv.reshape(1, Mkv * B, 2, 1, H, K)
+                q = q.reshape(1, M * B, 1, H, K)
+            return xformers_gqa(
+                q,
+                kv[:,:,0],
+                kv[:,:,1],
+                attn_bias=xformers_attn_bias,
+                op=(xformers_op, None),
+                # op=(fmha.cutlass.FwOp, None),
+            )
+            return fmha.memory_efficient_attention(
+                query=q.reshape(1, B*M, H, K),
+                key=kv[:,:,0],
+                value=kv[:,:,1],
+                attn_bias=xformers_attn_bias,
+                # op=(fmha.triton_splitk.FwOp, None)
+            )
         assert q.dtype in [torch.float16, torch.bfloat16]
         assert q.is_cuda and kv.is_cuda
         causal = self.causal if causal is None else causal
@@ -295,12 +351,39 @@ class LinearResidual(nn.Linear):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return super().forward(input), input
 
+@triton.jit
+def memcopy_indexed_k(destination, destination_stride, index, source, BLOCK_SIZE: tl.constexpr):
+    block_id = tl.program_id(axis=0)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+
+    index_loaded = tl.load(index)
+    data = tl.load(source + offsets)
+    tl.store(destination + index_loaded * destination_stride + offsets, data)
+
+def memcopy_indexed(destination, index_cu, source):
+    assert destination[0].is_contiguous
+    assert destination[0].shape == source.shape
+    elements = destination[0].numel()
+
+    BLOCK_SIZE = 128
+    assert elements % BLOCK_SIZE == 0
+
+    memcopy_indexed_k[(elements // BLOCK_SIZE, 1, 1)](
+        destination,
+        destination.stride(0),
+        index_cu,
+        source,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+
 
 def _update_kv_cache(kv, inference_params, layer_idx):
     """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
     # Pre-allocate memory for key-values for inference.
     num_heads, head_dim = kv.shape[-2:]
     if layer_idx not in inference_params.key_value_memory_dict:
+        assert not inference_params.fused_ft_kernel
         kv_cache = torch.empty(
             inference_params.max_batch_size,
             inference_params.max_sequence_len,
@@ -330,11 +413,15 @@ def _update_kv_cache(kv, inference_params, layer_idx):
     # Copy key and values.
     if not inference_params.fused_ft_kernel:
         assert kv_cache is not None
-        kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
+        if kv.shape[1] == 1 and batch_end == batch_start + 1:
+            # CUDA-Graph friendly copy
+            memcopy_indexed(kv_cache[batch_start], inference_params.sequence_len_offset_cu, kv[0,0])
+        else:
+            kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
         kv = kv_cache[batch_start:batch_end, :sequence_end, ...]
         return kv
     else:
-        assert inference_params.sequence_len_offset == 0
+        assert inference_params.is_prefill
         # FT kernel requires different layouts for the k_cache and v_cache.
         assert kv.dtype in [torch.float16, torch.bfloat16, torch.float32]
         packsize = 4 if kv.dtype == torch.float32 else 8
@@ -601,7 +688,9 @@ class MHA(nn.Module):
             assert not self.dwconv
 
         kwargs = (
-            {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
+            {"cu_seqlens": cu_seqlens,
+            "max_seqlen": max_seqlen,
+            **kwargs}
             if self.use_flash_attn
             else {"key_padding_mask": key_padding_mask, **kwargs}
         )
@@ -619,11 +708,16 @@ class MHA(nn.Module):
             qkv = rearrange(qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim)
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.is_prefill
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, seqlen_offset_cu=inference_params.sequence_len_offset_cu)
+                    # TODO: We could write directly to KV cache in theory...
+                    qkv = self.rotary_emb(
+                        qkv,
+                        seqlen_offset=seqlen_offset,
+                        seqlen_offset_cu=inference_params.sequence_len_offset_cu,
+                    )
 
                 if inference_params is None:
                     if not self.checkpointing:
@@ -633,7 +727,19 @@ class MHA(nn.Module):
                 else:
                     q = qkv[:, :, 0]
                     kv = self._update_kv_cache(qkv[:, :, 1:], inference_params)
-                    context = self.inner_cross_attn(q, kv)
+                    causal = None if inference_params.is_prefill else False
+                    if inference_params.xformers_attn_bias is not None and q.shape[1] == 1 and isinstance(self.inner_cross_attn, FlashCrossAttention):
+                        kv = inference_params.key_value_memory_dict[self.layer_idx]
+                        assert kv.ndim == 5  # BM2HK
+                        assert kv.shape[1] == inference_params.xformers_attn_bias.k_seqinfo.padding
+                        context = self.inner_cross_attn(
+                            q,
+                            kv,
+                            xformers_attn_bias=inference_params.xformers_attn_bias,
+                            xformers_op=inference_params.xformers_op,
+                        )
+                    else:
+                        context = self.inner_cross_attn(q, kv)
             else:
                 context = self._apply_rotary_single_query_attention(qkv, inference_params)
         else:
@@ -666,11 +772,16 @@ class MHA(nn.Module):
                 ).contiguous()
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.is_prefill
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+                    q, kv = self.rotary_emb(
+                        q,
+                        kv,
+                        seqlen_offset=seqlen_offset,
+                        seqlen_offset_cu=inference_params.sequence_len_offset_cu,
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_cross_attn(q, kv, **kwargs)
@@ -680,7 +791,18 @@ class MHA(nn.Module):
                         )
                 else:
                     kv = self._update_kv_cache(kv, inference_params)
-                    context = self.inner_cross_attn(q, kv)
+                    if inference_params.xformers_attn_bias is not None and q.shape[1] == 1:
+                        kv = inference_params.key_value_memory_dict[self.layer_idx]
+                        assert kv.ndim == 5  # BM2HK
+                        assert kv.shape[1] == inference_params.xformers_attn_bias.k_seqinfo.padding
+                        context = self.inner_cross_attn(
+                            q,
+                            kv,
+                            xformers_attn_bias=inference_params.xformers_attn_bias,
+                            xformers_op=inference_params.xformers_op
+                        )
+                    else:
+                        context = self.inner_cross_attn(q, kv)
             else:
                 context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
         out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
@@ -856,7 +978,7 @@ class ParallelMHA(nn.Module):
             qkv = rearrange(qkv, "b s (three h d) -> b s three h d", three=3, d=self.head_dim)
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.is_prefill
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
@@ -886,11 +1008,16 @@ class ParallelMHA(nn.Module):
             )
             if (
                 inference_params is None
-                or inference_params.sequence_len_offset == 0
+                or inference_params.is_prefill
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    q, kv = self.rotary_emb(q, kv, seqlen_offset=seqlen_offset)
+                    q, kv = self.rotary_emb(
+                        q,
+                        kv,
+                        seqlen_offset=seqlen_offset,
+                        seqlen_offset_cu=inference_params.sequence_len_offset_cu,
+                    )
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_cross_attn(q, kv, **kwargs)
@@ -900,7 +1027,18 @@ class ParallelMHA(nn.Module):
                         )
                 else:
                     kv = self._update_kv_cache(kv, inference_params)
-                    context = self.inner_cross_attn(q, kv)
+                    if inference_params.xformers_attn_bias is not None and q.shape[1] == 1 and isinstance(self.inner_cross_attn, FlashCrossAttention):
+                        kv = inference_params.key_value_memory_dict[self.layer_idx]
+                        assert kv.ndim == 5  # BM2HK
+                        assert kv.shape[1] == inference_params.xformers_attn_bias.k_seqinfo.padding
+                        context = self.inner_cross_attn(
+                            q,
+                            kv,
+                            xformers_attn_bias=inference_params.xformers_attn_bias,
+                            xformers_op=inference_params.xformers_op
+                        )
+                    else:
+                        context = self.inner_cross_attn(q, kv)
             else:
                 context = self._apply_rotary_single_query_attention(q, inference_params, kv=kv)
         context = rearrange(context, "b s h d -> b s (h d)")
