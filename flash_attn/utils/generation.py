@@ -5,7 +5,7 @@ import time
 from collections import namedtuple
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Callable, Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union, Any
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,7 @@ from torch import Tensor
 from torch.profiler import ProfilerActivity, profile, record_function
 from transformers.generation import GreedySearchDecoderOnlyOutput, SampleDecoderOnlyOutput
 
+from xformers.ops import fmha
 
 @dataclass
 class InferenceParams:
@@ -22,11 +23,47 @@ class InferenceParams:
 
     max_sequence_len: int
     max_batch_size: int
-    sequence_len_offset: int = 0
+    sequence_len_offset: int = field(init=False)
+    sequence_len_offset_cu: Tensor = field(init=False, default=None)
+    xformers_attn_bias: fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask = field(init=False, default=None)
     batch_size_offset: int = 0
     key_value_memory_dict: dict = field(default_factory=dict)
     fused_ft_kernel: bool = False
     lengths_per_sample: Optional[Tensor] = None
+    is_prefill: bool = True
+    xformers_op: Any = None
+
+    def init_offset(self, offset, device) -> None:
+        self.sequence_len_offset = offset
+        if self.sequence_len_offset_cu is None:
+            self.sequence_len_offset_cu = torch.full([], offset, device=device, dtype=torch.int32)
+        self.sequence_len_offset_cu.fill_(offset)
+        if self.xformers_attn_bias is None:
+            self.xformers_attn_bias = fmha.attn_bias.BlockDiagonalCausalWithOffsetPaddedKeysMask.from_seqlens(
+                q_seqlen=[1] * self.max_batch_size,
+                kv_padding=self.max_sequence_len,
+                kv_seqlen=[offset + 1] * self.max_batch_size)
+            self.xformers_attn_bias.k_seqinfo.max_seqlen = self.max_sequence_len
+            self.xformers_attn_bias.q_seqinfo.to(device)
+            self.xformers_attn_bias.k_seqinfo.to(device)
+        self.xformers_attn_bias.k_seqinfo.seqlen.fill_(offset + 1)
+        self.xformers_attn_bias.k_seqinfo.seqlen_py = [
+            offset+1 for i in self.xformers_attn_bias.k_seqinfo.seqlen_py
+        ]
+        
+        self.is_prefill = (offset == 0)
+        self.sequence_len_offset2 = self.sequence_len_offset
+
+    def incr(self) -> None:
+        self.sequence_len_offset += 1
+        assert self.sequence_len_offset + 1 <= self.xformers_attn_bias.k_seqinfo.max_seqlen
+        self.sequence_len_offset_cu.add_(1)
+        self.xformers_attn_bias.k_seqinfo.seqlen.add_(1)
+        self.xformers_attn_bias.k_seqinfo.seqlen_py = [
+            i+1 for i in self.xformers_attn_bias.k_seqinfo.seqlen_py
+        ]
+        self.is_prefill = False
+        self.sequence_len_offset2 = self.sequence_len_offset
 
 
 # https://github.com/NVIDIA/Megatron-LM/blob/0bb597b42c53355a567aba2a1357cc34b9d99ddd/megatron/text_generation/sampling.py
@@ -98,6 +135,7 @@ def decode(
     fused_ft_kernel=False,
     cg=False,
     timing=False,
+    xformers_op=None,
 ):
     """Decoding, either greedy or with top-k or top-p sampling.
     If top-k = 0, don't limit the number of candidates (pure sampling).
@@ -117,7 +155,7 @@ def decode(
     batch_size, seqlen_og = input_ids.shape
     teacher_output_len = teacher_outputs.shape[1] if teacher_outputs is not None else 0
     if cg:
-        assert fused_ft_kernel
+        # assert fused_ft_kernel
         if not hasattr(model, "_decoding_cache"):
             model._decoding_cache = None
         model._decoding_cache = update_graph_cache(
@@ -127,15 +165,30 @@ def decode(
             seqlen_og,
             max_length,
             tensor_parallel=tensor_parallel,
+            fused_ft_kernel=fused_ft_kernel,
+            xformers_op=xformers_op,
         )
         inference_params = model._decoding_cache.inference_params
         inference_params.max_sequence_len = max_length
         inference_params.max_batch_size = batch_size
-        inference_params.sequence_len_offset = 0
+        inference_params.fused_ft_kernel = fused_ft_kernel
     else:
         inference_params = InferenceParams(
             max_sequence_len=max_length, max_batch_size=batch_size, fused_ft_kernel=fused_ft_kernel
         )
+        param_example = next(iter(model.parameters()))
+        inf_cache = model.allocate_inference_cache(batch_size, max_length, param_example.dtype, fused_ft_kernel=fused_ft_kernel)
+        inference_params.key_value_memory_dict = inf_cache
+    inference_params.init_offset(0, input_ids.device)
+    inference_params.xformers_op = xformers_op
+
+    def get_timing():
+        if timing:
+            if tensor_parallel > 1:
+                torch.distributed.barrier()
+            torch.cuda.synchronize()
+            return time.time()
+        return -1.0
 
     def logits_forward_fn(input_ids, position_ids, inference_params):
         if not cg:
@@ -160,18 +213,21 @@ def decode(
             if tensor_parallel > 1:
                 torch.distributed.barrier()
             torch.cuda.synchronize()
-            start = time.time()
+        
+        start = get_timing()
         logits = model(
             input_ids, inference_params=inference_params, num_last_tokens=1
         ).logits.squeeze(dim=1)
         logits = logits_postprocess_fn(logits)
-        scores.append(logits if not cg else logits.clone())
+        score = logits if not cg else logits.clone()
+        scores.append(score[:, -1, :])
         if teacher_outputs is None or teacher_output_len <= seqlen_og:
             next_token = sample(logits, top_k=top_k, top_p=top_p, temperature=temperature)
         else:
             next_token = teacher_outputs[:, seqlen_og]
         sequences = [next_token]
-        inference_params.sequence_len_offset = seqlen_og
+        inference_params.init_offset(seqlen_og, input_ids.device)
+        begin_decoding = get_timing()
         while True:
             position_ids = torch.full(
                 (batch_size, 1),
@@ -191,20 +247,24 @@ def decode(
             else:
                 next_token = teacher_outputs[:, inference_params.sequence_len_offset + 1]
             sequences.append(next_token)
-            inference_params.sequence_len_offset += 1
+            inference_params.incr()
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
             if inference_params.sequence_len_offset >= max_length - 1:
                 break
+
+        output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput
+        out = output_cls(
+            sequences=torch.cat([input_ids, torch.stack(sequences, dim=1)], dim=1), scores=tuple(scores)
+        )
         if timing:
-            if tensor_parallel > 1:
-                torch.distributed.barrier()
-            torch.cuda.synchronize()
-            print(f"Prompt processing + decoding time: {(time.time() - start) * 1000:.0f}ms")
-    output_cls = GreedySearchDecoderOnlyOutput if top_k == 1 else SampleDecoderOnlyOutput
-    return output_cls(
-        sequences=torch.cat([input_ids, torch.stack(sequences, dim=1)], dim=1), scores=tuple(scores)
-    )
+            end = get_timing()
+            out.time_prompt = begin_decoding - start
+            decoding_total = end - begin_decoding
+            out.time_decode_iter = decoding_total / (len(sequences) - 1)
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print(f"Prompt processing: {out.time_prompt * 1000:.0f}ms, decoding time for {(len(sequences) - 1)} iters: {decoding_total * 1000:.0f}ms (per-iter: {out.time_decode_iter * 1000:.0f}ms)")
+    return out
 
 
 def sample_speculative(logits, logits_draft, tokens_draft, top_k=1, top_p=0.0, temperature=1.0):
@@ -640,7 +700,8 @@ class DecodingCGCache:
 
 @torch.inference_mode()
 def update_graph_cache(
-    model, cache, batch_size, seqlen_og, max_seqlen, tensor_parallel=1, dtype=None, n_warmups=2
+    model, cache, batch_size, seqlen_og, max_seqlen, tensor_parallel=1, dtype=None, n_warmups=2,
+    fused_ft_kernel=True, xformers_op=None,
 ):
     if cache is None:
         cache = DecodingCGCache()
@@ -660,7 +721,7 @@ def update_graph_cache(
         cache.device, cache.dtype = device, dtype
         cache.max_batch_size, cache.max_seqlen = batch_size, max_seqlen
         if hasattr(model, "allocate_inference_cache"):
-            inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype)
+            inf_cache = model.allocate_inference_cache(batch_size, max_seqlen, dtype, fused_ft_kernel=fused_ft_kernel)
         else:
             headdim = getattr(
                 model.config,
@@ -680,11 +741,12 @@ def update_graph_cache(
         cache.inference_params = InferenceParams(
             max_sequence_len=max_seqlen,
             max_batch_size=batch_size,
-            sequence_len_offset=seqlen_og,
             key_value_memory_dict=inf_cache,
-            fused_ft_kernel=True,
+            fused_ft_kernel=fused_ft_kernel,
             lengths_per_sample=lengths_per_sample,
+            xformers_op=xformers_op,
         )
+        cache.inference_params.init_offset(seqlen_og, device)
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
     for s_type in range(seqlen_to_seqlen_type(seqlen_og), seqlen_to_seqlen_type(max_seqlen) + 1):
         if (batch_size, s_type) not in cache.callables:
@@ -716,7 +778,7 @@ def capture_graph(model, inference_params, batch_size, max_seqlen, mempool=None,
     sequence_len_offset_og = inference_params.sequence_len_offset
     # TD [2023-04-14]: important for correctness of the FT's attention kernel, as seqlen_cpu is
     # used to determine the size of smem. Hence seqlen_cpu must be >= lengths_per_sample.
-    inference_params.sequence_len_offset = max_seqlen - 1
+    inference_params.init_offset(max_seqlen - 1, device=device)
     inference_params.lengths_per_sample[:] = max_seqlen - 1
 
     # Warmup before capture
@@ -750,6 +812,7 @@ def capture_graph(model, inference_params, batch_size, max_seqlen, mempool=None,
 
     def run(new_input_ids, new_position_ids, seqlen):
         inference_params.lengths_per_sample[:] = seqlen
+        inference_params.init_offset(seqlen, new_input_ids.device)
         input_ids.copy_(new_input_ids)
         position_ids.copy_(new_position_ids)
         graph.replay()

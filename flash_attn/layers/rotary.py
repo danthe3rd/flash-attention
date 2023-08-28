@@ -6,7 +6,81 @@ from typing import Optional, Tuple
 import rotary_emb
 import torch
 from einops import rearrange, repeat
+import triton
+import triton.language as tl
+import torch
 
+@triton.jit
+def apply_rotary_emb_triton_k(
+    # NOTE: Assumes x/out/cos/sin are contiguous
+    x,         # [B, 1, H, 2K]
+    cos,        # [MAX_LEN, K]
+    sin,        # [MAX_LEN, K]
+    seqpos_ptr, # int64, with `seqpos < MAX_LEN`
+    x_sB,
+    x_sM,
+    x_sH,
+    H,
+    K: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
+):
+    batch = tl.program_id(axis=0)
+    head = tl.program_id(axis=1)
+
+    seqpos = tl.load(seqpos_ptr)
+
+    batch_head_offset = batch * x_sB + head * x_sH
+    if INTERLEAVED:
+        off1 = tl.arange(0, K) * 2
+        off2 = tl.arange(0, K) * 2 + 1
+    else:
+        off1 = tl.arange(0, K)
+        off2 = tl.arange(K, 2 * K)
+    x1_ptrs = x + batch_head_offset + off1
+    x2_ptrs = x + batch_head_offset + off2
+
+    x1_values = tl.load(x1_ptrs)
+    x2_values = tl.load(x2_ptrs)
+    cos_values = tl.load(cos + tl.arange(0, K) + seqpos * K)
+    sin_values = tl.load(sin + tl.arange(0, K) + seqpos * K)
+
+    out1_values = x1_values * cos_values - x2_values * sin_values
+    out2_values = x1_values * sin_values + x2_values * cos_values
+
+    tl.store(x1_ptrs, out1_values)
+    tl.store(x2_ptrs, out2_values)
+
+def apply_rotary_emb_triton(x, cos, sin, seqpos_cu, interleaved=False):
+    """
+    x: (batch_size, seqlen, nheads, headdim)
+    cos, sin: (seqlen, rotary_dim / 2)
+
+    Applied rotary in-place
+    """
+    assert x.ndim == 4, f"Expected format BMNHK, but got shape {x.shape}"
+    B, M, H, K = x.shape
+    assert M == 1, "Only supports seqlen=1"
+    assert cos.is_contiguous()
+    assert sin.is_contiguous()
+    assert cos.ndim == 2
+    assert cos.shape == sin.shape
+    assert K == cos.shape[-1] * 2
+    assert seqpos_cu.dtype in [torch.int32, torch.int64]
+
+    grid = (B, H, 1)
+    apply_rotary_emb_triton_k[grid](
+        x=x,
+        x_sB=x.stride(0),
+        x_sM=x.stride(1),
+        x_sH=x.stride(2),
+        cos=cos,
+        sin=sin,
+        seqpos_ptr=seqpos_cu,
+        H=H,
+        K=K // 2,
+        INTERLEAVED=interleaved,
+    )
+    return x
 
 def rotate_half(x, interleaved=False):
     if not interleaved:
@@ -372,7 +446,11 @@ class RotaryEmbedding(torch.nn.Module):
                 self._sin_k_cached = (torch.sin(freqs) / scale).to(dtype)
 
     def forward(
-        self, qkv: torch.Tensor, kv: Optional[torch.Tensor] = None, seqlen_offset: int = 0
+        self,
+        qkv: torch.Tensor,
+        kv: Optional[torch.Tensor] = None,
+        seqlen_offset: int = 0,
+        seqlen_offset_cu: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         qkv: (batch, seqlen, 3, nheads, headdim) if kv is none,
@@ -382,9 +460,22 @@ class RotaryEmbedding(torch.nn.Module):
         token in the batch.
         """
         seqlen = qkv.shape[1]
+        can_use_triton_fw_only = seqlen == 1 and not qkv.requires_grad and seqlen_offset_cu is not None
         self._update_cos_sin_cache(seqlen + seqlen_offset, device=qkv.device, dtype=qkv.dtype)
         if kv is None:
             if self.scale is None:
+                if can_use_triton_fw_only:
+                    # CUDA-graph friendly version for decoding
+                    B, M, _, H, K = qkv.shape
+                    apply_rotary_emb_triton(
+                        # Applies in-place, only to Q/K (skip V)
+                        x=qkv[:, :, :2].view([B, M, 2 * H, K]),
+                        cos=self._cos_cached,
+                        sin=self._sin_cached,
+                        interleaved=self.interleaved,
+                        seqpos_cu=seqlen_offset_cu,
+                    )
+                    return qkv
                 return apply_rotary_emb_qkv_(
                     qkv,
                     self._cos_cached[seqlen_offset:],
@@ -404,14 +495,33 @@ class RotaryEmbedding(torch.nn.Module):
                 )
         else:
             q = qkv
-            q = apply_rotary_emb_func(
-                q,
-                self._cos_cached[seqlen_offset:],
-                self._sin_cached[seqlen_offset:],
-                self.interleaved,
-                True,
-            )
-            if self.scale is None:
+            if can_use_triton_fw_only:
+                # CUDA-graph friendly version for decoding
+                apply_rotary_emb_triton(
+                    x=q,
+                    cos=self._cos_cached,
+                    sin=self._sin_cached,
+                    interleaved=self.interleaved,
+                    seqpos_cu=seqlen_offset_cu,
+                )
+            else:
+                q = apply_rotary_emb_func(
+                    q,
+                    self._cos_cached[seqlen_offset:],
+                    self._sin_cached[seqlen_offset:],
+                    self.interleaved,
+                    True,
+                )
+            if self.scale is None and can_use_triton_fw_only:
+                # CUDA-graph friendly version for decoding
+                apply_rotary_emb_triton(
+                    x=kv[:, :, 0],  # Only applies to K, not to V
+                    cos=self._cos_cached,
+                    sin=self._sin_cached,
+                    interleaved=self.interleaved,
+                    seqpos_cu=seqlen_offset_cu,
+                )
+            elif self.scale is None:
                 kv = apply_rotary_emb_kv_(
                     kv,
                     self._cos_cached[seqlen_offset:],

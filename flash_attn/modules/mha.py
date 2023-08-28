@@ -623,7 +623,8 @@ class MHA(nn.Module):
                 or not inference_params.fused_ft_kernel
             ):
                 if self.rotary_emb_dim > 0:
-                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset)
+                    qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, seqlen_offset_cu=inference_params.sequence_len_offset_cu)
+
                 if inference_params is None:
                     if not self.checkpointing:
                         context = self.inner_attn(qkv, **kwargs)
