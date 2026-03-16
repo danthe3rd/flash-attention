@@ -634,8 +634,6 @@ setup(
             "docs",
             "benchmarks",
             "flash_attn.egg-info",
-            "flash_attn.cute",
-            "flash_attn.cute.*",
         )
     ),
     author="Tri Dao",
